@@ -4,7 +4,7 @@ import pyodbc
 from datetime import datetime
 import os
 from dotenv import load_dotenv
-
+from requests.status_codes import codes
 # Load environment variables from .env file
 load_dotenv()
 
@@ -22,7 +22,7 @@ def fetch_news(stock_symbol):
     url = f"{NEWS_API_URL}?q={stock_symbol}&sortBy=publishedAt&apiKey={API_KEY}"
     response = requests.get(url)
     
-    if response.status_code == 200:
+    if response.status_code == codes.ok:
         news_data = response.json()
         articles = news_data.get('articles', [])
         return articles  # List of articles
