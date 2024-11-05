@@ -1,0 +1,2 @@
+2024-11-02 15:48:52,790 - INFO - Fetched news sources from NewsAPI: 128 sources retrieved.
+2024-11-02 15:48:52,793 - INFO - Saved API response to data\2024-11-02\news_sources.json
