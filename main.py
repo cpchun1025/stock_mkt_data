@@ -105,26 +105,26 @@ def main():
     populate_news_sources(session)
 
     # Step 2: Fetch and process articles for various countries
-    # country_codes = ['us', 'gb', 'jp']  # Example country codes for headlines
-    # for country_code in country_codes:
-    #     logger.info(f"Fetching top headlines for {country_code}...")
-    #     articles = fetch_top_headlines(country_code)
+    country_codes = ['us', 'gb', 'jp']  # Example country codes for headlines
+    for country_code in country_codes:
+        logger.info(f"Fetching top headlines for {country_code}...")
+        articles = fetch_top_headlines(country_code)
 
-    #     if articles:
-    #         for article in articles:
-    #             # Perform sentiment analysis on the article content or description
-    #             content = article.get('content', '') or article.get('description', '')
+        if articles:
+            for article in articles:
+                # Perform sentiment analysis on the article content or description
+                content = article.get('content', '') or article.get('description', '')
 
-    #             # Get BERT and TextBlob sentiment results
-    #             bert_label, bert_score, blob_label, blob_polarity, blob_subjectivity = analyze_sentiment(content)
+                # Get BERT and TextBlob sentiment results
+                bert_label, bert_score, blob_label, blob_polarity, blob_subjectivity = analyze_sentiment(content)
 
-    #             # Step 3: Store the article
-    #             article_id = store_news_article(session, article, source_code=country_code, source_type='country')
+                # Step 3: Store the article
+                article_id = store_news_article(session, article, source_code=country_code, source_type='country')
 
-    #             # If the article was successfully stored, store the sentiment analysis as well
-    #             if article_id:
-    #                 store_sentiment_analysis(session, article_id, "BERT", bert_label, bert_score)
-    #                 store_sentiment_analysis(session, article_id, "TextBlob", blob_label, polarity=blob_polarity, subjectivity=blob_subjectivity)
+                # If the article was successfully stored, store the sentiment analysis as well
+                if article_id:
+                    store_sentiment_analysis(session, article_id, "BERT", bert_label, bert_score)
+                    store_sentiment_analysis(session, article_id, "TextBlob", blob_label, polarity=blob_polarity, subjectivity=blob_subjectivity)
 
     # Step 3: Fetch and process articles for specific stock symbols
     stock_symbols = ['AAPL', 'GOOGL', 'MSFT']  # Example stock symbols
