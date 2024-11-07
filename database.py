@@ -1,8 +1,10 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, Text, Float, DateTime, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+
 from dotenv import load_dotenv
+from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, String,
+                        Text, Unicode, UnicodeText, create_engine)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship, sessionmaker
 
 # Load environment variables from .env file
 load_dotenv()
@@ -24,9 +26,9 @@ class NewsApiSource(Base):
     __tablename__ = 'NewsApiSource'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    api_source_id = Column(String(255), nullable=False, unique=True, index=True)  # API returned source ID (e.g., 'the-irish-times')
-    api_source_name = Column(String(1024), nullable=False)  # API returned source name (e.g., 'The Irish Times')
-    description = Column(Text)  # Optional description
+    api_source_id = Column(String(50), nullable=False, unique=True, index=True)  # API returned source ID
+    api_source_name = Column(Unicode(255), nullable=False)  # Unicode support for multi-language names
+    description = Column(UnicodeText)  # Unicode support for multi-language descriptions
 
     # Relationship to NewsSources
     news_sources = relationship('NewsSources', back_populates='api_source')
