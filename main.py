@@ -1,16 +1,23 @@
 import logging
+import os
 from datetime import datetime
+
+from newsapi import NewsApiClient
 from sqlalchemy.orm import Session
 
-from database import create_tables, Session, NewsArticles, SentimentAnalysis, NewsSources, NewsApiSource
-from news_fetcher import populate_news_sources, fetch_top_headlines, fetch_news
+from database import (NewsApiSource, NewsArticles, NewsSources,
+                      SentimentAnalysis, Session, create_tables)
 from sentiment_analysis import analyze_sentiment
+
+API_KEY = os.getenv('NEWS_API_KEY')
+
+# Initialize the NewsApiClient with your API key
+newsapi = NewsApiClient(api_key=API_KEY)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('NewsAPI')
 
-from datetime import datetime
 
 def store_news_article(session, article, source_code=None, source_type=None):
     """
@@ -78,6 +85,7 @@ def store_news_article(session, article, source_code=None, source_type=None):
         logger.error(f"Failed to store article: {article.get('title', 'No Title')}. Error: {str(e)}")
         return None
 
+
 # Store sentiment analysis results in the SentimentAnalysis table
 def store_sentiment_analysis(session, article_id, model_name, sentiment_label, confidence_score=None, polarity=None, subjectivity=None):
     """
@@ -95,20 +103,42 @@ def store_sentiment_analysis(session, article_id, model_name, sentiment_label, c
     session.commit()
     logger.info(f"Stored sentiment analysis for article_id: {article_id} using {model_name}")
 
+
+# Function to fetch top headlines using the NewsAPI Python client
+def fetch_top_headlines(country_code):
+    """
+    Fetch top headlines from NewsAPI for a given country code.
+    """
+    response = newsapi.get_top_headlines(country=country_code)
+    return response.get('articles', [])
+
+
+# Function to fetch news for specific stock symbols using the NewsAPI Python client
+def fetch_news(stock_symbol):
+    """
+    Fetch news articles from NewsAPI related to a specific stock symbol.
+    """
+    response = newsapi.get_everything(q=stock_symbol)
+    return response.get('articles', [])
+
+# Function to fetch news using the NewsAPI /everything endpoint
+def fetch_news_by_country(keyword):
+    """
+    Fetch news articles from NewsAPI using the /everything endpoint with a specific keyword (e.g., country name).
+    """
+    response = newsapi.get_everything(q=keyword)
+    return response.get('articles', [])
+
 # Main function to fetch, analyze, and store news articles
 def main():
     # Create a new session
     session = Session()
 
-    # Step 1: Populate NewsApiSource table
-    logger.info("Populating NewsApiSource table...")
-    populate_news_sources(session)
-
-    # Step 2: Fetch and process articles for various countries
-    country_codes = ['us', 'gb', 'jp']  # Example country codes for headlines
-    for country_code in country_codes:
-        logger.info(f"Fetching top headlines for {country_code}...")
-        articles = fetch_top_headlines(country_code)
+    # Step 1: Fetch and process articles for various countries using keywords
+    country_keywords = ['Japan', 'United Kingdom']  # Example keywords related to countries
+    for country_keyword in country_keywords:
+        logger.info(f"Fetching news for country: {country_keyword}...")
+        articles = fetch_news_by_country(country_keyword)
 
         if articles:
             for article in articles:
@@ -118,15 +148,14 @@ def main():
                 # Get BERT and TextBlob sentiment results
                 bert_label, bert_score, blob_label, blob_polarity, blob_subjectivity = analyze_sentiment(content)
 
-                # Step 3: Store the article
-                article_id = store_news_article(session, article, source_code=country_code, source_type='country')
+                # Step 2: Store the article
+                article_id = store_news_article(session, article, source_code=country_keyword, source_type='country')
 
                 # If the article was successfully stored, store the sentiment analysis as well
                 if article_id:
                     store_sentiment_analysis(session, article_id, "BERT", bert_label, bert_score)
                     store_sentiment_analysis(session, article_id, "TextBlob", blob_label, polarity=blob_polarity, subjectivity=blob_subjectivity)
-
-    # Step 3: Fetch and process articles for specific stock symbols
+    # Step 2: Fetch and process articles for specific stock symbols
     stock_symbols = ['AAPL', 'GOOGL', 'MSFT']  # Example stock symbols
     for stock_symbol in stock_symbols:
         logger.info(f"Fetching news for stock symbol: {stock_symbol}...")
@@ -150,6 +179,7 @@ def main():
 
     # Close the session once everything is done
     session.close()
+
 
 if __name__ == '__main__':
     # Ensure tables are created before running the script
