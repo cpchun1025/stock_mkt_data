@@ -1,0 +1,113 @@
+回測結果為每個 CSI1000 標的（RIC）計算並彙總三個核心指標：勝率（Win rate）、夏普比率（Sharpe ratio）與最大回撤（Max Drawdown）。我會說明資料來源、計算口徑與常見陷阱，並指出你在我們已提供的 backtest_signals 輸出裡要用到哪些欄位。
+
+一、核心概念與口徑
+
+事件驅動的短線回測
+你的策略在出現 entry_signal 時「進場」，在固定時間視窗（如 30/60/120 秒）「出場」。
+每筆交易得到一個淨報酬 r_i（已扣成本）。
+指標定義
+勝率（Win rate）= 正報酬交易數 / 總交易數。
+夏普比率（Sharpe）= 平均報酬 / 報酬標準差。短線事件策略常用「每筆交易」作單位（不年化），做跨標的橫向比較足夠；若需年化，需假設日均交易次數與交易日數。
+最大回撤（Max Drawdown）= 以報酬累積曲線的峰值到之後最低谷的最大跌幅。你可以用「每筆交易的淨報酬」累乘成權益曲線，再計回撤。
+二、數據流（從回測到指標）
+
+準備資料
+對每個 RIC，取 7 天 L1 資料，生成 signals（entry_signal）與 backtest 的 perf_df。
+perf_df 主要欄位（我們的 backtest_signals 已產出）：
+time：入場時間
+ret_30s_net、ret_60s_net、ret_120s_net：各視窗淨報酬
+其他診斷欄位：strength、rel_spread_in、mfe/mae 等
+選擇評估視窗
+先固定一個核心視窗（建議 60 秒，符號 H60），統一比較。也可同時保留 H30/H120 作敏感度觀察。
+生成交易序列與權益曲線
+取 r_i = ret_60s_net（或你指定的視窗）。
+權益曲線（Equity curve）：
+方法A（乘法）：E_0 = 1；E_k = E_{k-1} × (1 + r_k)。
+方法B（加法）：若 r 很小，可用累積和近似，但乘法更正確。
+從 E 序列計算勝率、Sharpe、最大回撤。
+計算三個指標
+勝率 Win rate = mean(r_i > 0)。
+Sharpe（每筆）= mean(r_i) / std(r_i)；樣本少時可加上小epsilon避免除零。
+如需年化（可選）：Sharpe_ann ≈ Sharpe_trade × sqrt(平均每日交易數 × 每年交易日)。
+最大回撤（基於乘法權益曲線）：
+定義高水位 H_k = max(E_0..E_k)；
+回撤 D_k = (E_k − H_k) / H_k（為負數）；最大回撤 = min(D_k)。
+三、把指標放回「每個 RIC 的彙總表」
+
+跑完每個 RIC 的 perf_df 後，對每個 RIC計：
+trades：交易數（樣本門檻例如 >= 30 筆才納入排名）
+win_rate：勝率
+sharpe：夏普（每筆）
+mdd：最大回撤
+mean、median：平均與中位數淨報酬（方便理解偏態）
+產生 all_summary DataFrame，欄位如：
+ric, trades, win_rate, sharpe, mdd, mean_60s, median_60s
+四、示意計算步驟（可直接套在 perf_df 上）
+假設你選 60 秒視窗：
+
+取 r = perf_df["ret_60s_net"].dropna()
+勝率：win = (r > 0).mean()
+Sharpe（每筆）：sharpe = r.mean() / (r.std() + 1e-12)
+權益曲線與最大回撤：
+E = np.cumprod(1 + r.values)
+highwater = np.maximum.accumulate(E)
+drawdown = E / (highwater + 1e-12) - 1
+mdd = drawdown.min() # 一個非正數，例如 -0.12 表示 -12%
+注意：
+若交易間隔不等（短線常見），以「每筆」為單位比較是可以的；要做時間加權或年化，需再加上時間信息。
+五、常見陷阱與建議
+
+樣本不足：若某 RIC 7 天只有少量訊號，指標不穩健。設定最小交易數門檻，否則標註為 N/A。
+成本穩健性：同一批資料，用 baseline 與 slip_proxy 兩種成本模型各算一套指標；若兩者均為正，可信度較高。
+清洗時間段：去掉開盤前3–5分鐘、收盤前5分鐘；午休斷開，避免跨段窗口影響。
+黑名單：平均 rel_spread 長期高於門檻或 mdd 極深的標的，列入黑名單。
+多視窗對比：H30/H60/H120 同時計算，有助判斷策略時間尺度的穩健性。
+六、簡潔程式片段（把指標計入 summary 表）
+以下函式接 perf_df，回傳三個指標。你可在批量迴圈中呼叫，塞進 all_summary。
+
+python
+
+Run
+
+Copy
+import numpy as np
+import pandas as pd
+
+def metrics_from_perf(perf_df, horizon_sec=60, min_trades=20):
+    col = f"ret_{horizon_sec}s_net"
+    x = perf_df[col].dropna().values
+    out = {"trades": len(x), "win_rate": np.nan, "sharpe": np.nan, "mdd": np.nan,
+           "mean": np.nan, "median": np.nan}
+    if len(x) < min_trades:
+        return out  # 樣本不足
+    out["win_rate"] = float((x > 0).mean())
+    out["mean"] = float(np.mean(x))
+    out["median"] = float(np.median(x))
+    std = float(np.std(x, ddof=0))
+    out["sharpe"] = float(out["mean"] / (std + 1e-12))
+    # 權益曲線與最大回撤
+    E = np.cumprod(1.0 + x)
+    highwater = np.maximum.accumulate(E)
+    drawdown = E / (highwater + 1e-12) - 1.0
+    out["mdd"] = float(drawdown.min())  # 例如 -0.18 代表 -18%
+    return out
+七、整體批量流程（摘要）
+
+載入 CSI1000 RIC 清單
+對每個 RIC：
+載入 7 天 L1 資料 → 清洗時間段
+signals = analyzer.generate_trend_signals(df)
+perf_df, summary, by_bins = backtest_signals(df, signals, horizons=[30,60,120], ...)
+指標 = metrics_from_perf(perf_df, horizon_sec=60, min_trades=20)
+all_summary 追加一行：ric + 指標（也可加 H30/H120 的欄位）
+結果展示
+排行：按 sharpe 或 mean 排序的 Top/Bottom 20
+風險：顯示 mdd 分布、挑極端樣本做質檢
+分層：合併 by_bins["H60"] 做 3x3 表（strength x cost）
+一致性：baseline vs slip_proxy 兩套指標並列，挑「雙正」的白名單
+八、如何解讀
+
+勝率高但 Sharpe 低：盈虧比可能太低（多小贏少大輸）；需設止損或改善入場。
+Sharpe 高但 mdd 深：可能有尾部風險（少數大虧）；檢視 MAE、加保護條件或降低槓桿。
+分層差異顯著：把「高強度＋低成本」作為實盤必備過濾條件。
+有了這套流程，你就能對每個 CSI1000 標的輸出清楚的三件事：能不能做（成本與滑點）、值不值得做（Sharpe/mean）、風險多大（最大回撤）。如果你想，我可以幫你把批量腳本做成一鍵產出 CSV 報表，順便輸出 Top/Bottom 榜單與回撤曲線圖。
