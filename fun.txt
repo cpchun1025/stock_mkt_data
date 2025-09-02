@@ -1,0 +1,603 @@
+可以，先做一套「基本面/價量特徵 → 評估（收益、相關、Sharpe、勝率）」的基線框架，之後再把微結構/做市參數接上。下面給你一個清晰流程與可直接跑的 Python 代碼。
+
+整體思路
+
+輸入
+價量日頻面板：date, ric, open, high, low, close, volume, amount（或 close*volume）
+基本面（可選）：按披露日對齊的 PE/PB、ROE、成長、負債率、自由流通股數、總市值等
+產特徵（示例）
+價量：動量（1/3/6 個月，排除最近5日）、短期反轉（5/10日）、波動率（20/60日）、Amihud 流動性、換手、價格層級（low price dummy）、相對 tick（0.01/close）
+基本面：盈利收益率（1/PE）、PB、ROE、成長率等（按公告日滯後對齊，避免前視）
+構造未來收益
+1D/5D/20D 前瞻收益（close 的前向變化），支持多個 horizon
+評估
+橫截面 IC（Spearman）：每天 feature vs 未來收益的秩相關，給均值、t 值
+分層/十分位多空：按特徵分組，計算多空（日度）收益序列，輸出均值、年化 Sharpe、勝率、累積曲線
+特徵之間的相關矩陣（Spearman），看共線性
+低價股注意
+以 rel_tick = 0.01/close 為刻度；可設 universe 過濾（如 close≥3 或 rel_tick≤30bp），與否都可做成開關並在報表中分組比較
+可直接跑的代碼（日頻）
+
+依賴：pandas、numpy
+資料格式：一個 DataFrame prices，欄位至少含 ["date","ric","open","high","low","close","volume"]；可選 "amount"、"free_float_shares"。基本面 df_funda 可為 None。
+python
+
+Run
+
+Copy
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Optional, Tuple
+
+# ========== 輔助 ==========
+def _to_panel(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+    df = df.sort_values(["date","ric"]).reset_index(drop=True)
+    return df
+
+def _winsorize_cs(s: pd.Series, p: float = 0.01) -> pd.Series:
+    lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lower=lo, upper=hi)
+
+def _cs_zscore(s: pd.Series) -> pd.Series:
+    return (s - s.mean()) / (s.std(ddof=0) + 1e-12)
+
+def _spearman_ic(x: pd.Series, y: pd.Series) -> float:
+    # 以秩相關近似 Spearman，忽略缺失
+    df = pd.concat([x, y], axis=1).dropna()
+    if len(df) < 5:
+        return np.nan
+    rx = df.iloc[:,0].rank()
+    ry = df.iloc[:,1].rank()
+    return rx.corr(ry)
+
+# ========== 特徵構造 ==========
+def build_features_daily(
+    prices: pd.DataFrame,
+    funda: Optional[pd.DataFrame] = None,
+    skip_recent_days_for_mom: int = 5
+) -> pd.DataFrame:
+    """
+    價量 + （可選）基本面特徵。輸入面板：date, ric, open/high/low/close, volume, (amount)
+    funda（可選）：date, ric, pe_ttm, pb, roe, growth, debt_to_equity, mkt_cap, free_float_shares
+    """
+    px = _to_panel(prices)
+
+    # 若沒有 amount，用 close*volume 近似
+    if "amount" not in px.columns:
+        px["amount"] = px["close"] * px["volume"]
+
+    # 日收益
+    px["ret_1d"] = px.groupby("ric")["close"].pct_change()
+
+    # 動量（排除最近 skip_recent_days_for_mom 天）
+    def mom(series, lookback, skip):
+        return series.pct_change(lookback + skip).shift(-skip)
+    for lb, name in [(21,"mom_1m"), (63,"mom_3m"), (126,"mom_6m")]:
+        px[name] = px.groupby("ric")["close"].apply(lambda s: mom(s, lb, skip_recent_days_for_mom))
+
+    # 短期反轉
+    px["rev_5d"] = -px.groupby("ric")["close"].pct_change(5)
+    px["rev_10d"] = -px.groupby("ric")["close"].pct_change(10)
+
+    # 波動率（20/60日）
+    for w in [20, 60]:
+        px[f"vol_{w}d"] = px.groupby("ric")["ret_1d"].rolling(w).std().reset_index(level=0, drop=True)
+
+    # Amihud 流動性（20日）
+    px["illiq_20d"] = (px["ret_1d"].abs() / (px["amount"] + 1e-12))
+    px["illiq_20d"] = px.groupby("ric")["illiq_20d"].rolling(20).mean().reset_index(level=0, drop=True)
+
+    # 換手與量能變化（若有自由流通）
+    if "free_float_shares" in px.columns:
+        px["turnover"] = px["volume"] / (px["free_float_shares"] + 1e-12)
+    else:
+        # 退而求其次：相對20日均量
+        px["turnover"] = px["volume"] / (px.groupby("ric")["volume"].rolling(20).mean().reset_index(level=0, drop=True) + 1e-12)
+
+    # 價格層級與相對tick
+    px["price"] = px["close"]
+    px["rel_tick"] = 0.01 / (px["price"].replace(0, np.nan))
+    px["rel_tick_bp"] = px["rel_tick"] * 1e4
+    px["low_price_flag"] = (px["price"] < 4.0).astype(int)
+
+    # 基本面：按披露日對齊，做1~3個交易日滯後（這裡簡化為按日合併再ffill+滯後1日）
+    if funda is not None and len(funda) > 0:
+        fd = _to_panel(funda)
+        # 對齊欄位名（可自行擴展）
+        keep = ["date","ric","pe_ttm","pb","roe","growth","debt_to_equity","mkt_cap","free_float_shares"]
+        fd = fd[[c for c in keep if c in fd.columns]].copy()
+        px = px.merge(fd, on=["date","ric"], how="left")
+        # 公告生效滯後：按股票 ffill，再 shift(1)
+        for c in ["pe_ttm","pb","roe","growth","debt_to_equity","mkt_cap","free_float_shares"]:
+            if c in px.columns:
+                px[c] = px.groupby("ric")[c].ffill().shift(1)
+        # 轉換：盈利收益率、log市值
+        if "pe_ttm" in px.columns:
+            px["earnings_yield"] = 1.0 / px["pe_ttm"].replace(0, np.nan)
+        if "mkt_cap" in px.columns:
+            px["ln_mktcap"] = np.log(px["mkt_cap"].replace(0, np.nan))
+
+    return px
+
+# ========== 前瞻收益與評估 ==========
+def make_forward_returns(px: pd.DataFrame, horizons: List[int]) -> pd.DataFrame:
+    df = px[["date","ric","close"]].copy()
+    for h in horizons:
+        df[f"fret_{h}d"] = df.groupby("ric")["close"].pct_change(h).shift(-h)
+    return df
+
+def cross_sectional_ic(
+    features_df: pd.DataFrame,
+    rets_df: pd.DataFrame,
+    feature_cols: List[str],
+    horizons: List[int],
+    universe_filter: Optional[pd.Series] = None
+) -> pd.DataFrame:
+    df = features_df.merge(rets_df, on=["date","ric"], how="inner")
+    if universe_filter is not None:
+        df = df[universe_filter.reindex(df.index, fill_value=True).values]
+    out = []
+    for h in horizons:
+        fret = f"fret_{h}d"
+        for dt, g in df.groupby("date"):
+            for f in feature_cols:
+                if f not in g.columns: continue
+                ic = _spearman_ic(g[f], g[fret])
+                out.append((dt, f, h, ic))
+    res = pd.DataFrame(out, columns=["date","feature","h","ic"]).dropna()
+    summary = res.groupby(["feature","h"])["ic"].agg(
+        ic_mean="mean",
+        ic_std=lambda s: s.std(ddof=0),
+        ic_t=lambda s: s.mean() / (s.std(ddof=0)/np.sqrt(len(s)) + 1e-12),
+        n="count"
+    ).reset_index()
+    return summary
+
+def ls_portfolio_backtest(
+    features_df: pd.DataFrame,
+    rets_df: pd.DataFrame,
+    feature: str,
+    horizon: int,
+    q: int = 10,
+    neutralize_by: Optional[str] = None,
+    universe_mask: Optional[pd.Series] = None
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    等權多空：每個交易日按 feature 分 q 組，做 Q_high - Q_low。
+    可選按 neutralize_by（如 ln_mktcap）做簡單橫截面回歸殘差後再分組。
+    """
+    df = features_df.merge(rets_df[["date","ric",f"fret_{horizon}d"]], on=["date","ric"], how="inner").copy()
+    if universe_mask is not None:
+        df = df[universe_mask.reindex(df.index, fill_value=True).values]
+    df = df.dropna(subset=[feature, f"fret_{horizon}d"])
+
+    # 橫截面 winsorize + zscore
+    def _prep(g):
+        x = g[feature].copy()
+        x = _winsorize_cs(x, 0.01)
+        x = _cs_zscore(x)
+        g["feat"] = x
+        if neutralize_by is not None and neutralize_by in g.columns:
+            z = g[neutralize_by]
+            z = (z - z.mean()) / (z.std(ddof=0)+1e-12)
+            # 簡單殘差：feat ~ z
+            beta = np.sum(z*g["feat"]) / (np.sum(z*z)+1e-12)
+            g["feat_res"] = g["feat"] - beta*z
+        else:
+            g["feat_res"] = g["feat"]
+        # 分組標籤
+        g["bin"] = pd.qcut(g["feat_res"], q=q, labels=False, duplicates="drop")
+        return g
+
+    df = df.groupby("date", group_keys=False).apply(_prep)
+
+    # 每日各組等權回報
+    grp = df.groupby(["date","bin"])[f"fret_{horizon}d"].mean().reset_index()
+    wide = grp.pivot(index="date", columns="bin", values=f"fret_{horizon}d").sort_index()
+    # 多空：最高組 - 最低組
+    ls = wide.iloc[:,-1] - wide.iloc[:,0]
+    ls = ls.dropna().rename("ls_ret")
+
+    # 統計
+    mean = ls.mean()
+    std = ls.std(ddof=0)
+    ann_sharpe = np.sqrt(252/horizon) * (mean / (std + 1e-12))  # 以 horizon 天為持有期折算
+    winrate = (ls > 0).mean()
+    summary = dict(
+        feature=feature,
+        horizon=horizon,
+        mean=mean,
+        std=std,
+        ann_sharpe=ann_sharpe,
+        winrate=winrate,
+        n=len(ls)
+    )
+    perf = pd.DataFrame({"date": ls.index, "ls_ret": ls.values}).set_index("date")
+    perf["cum"] = (1 + perf["ls_ret"]).cumprod()
+    return perf, summary
+
+def features_correlation(
+    features_df: pd.DataFrame,
+    feature_cols: List[str],
+    on_last_date: bool = True
+) -> pd.DataFrame:
+    df = features_df[["date","ric"] + feature_cols].copy()
+    if on_last_date:
+        last = df["date"].max()
+        df = df[df["date"] == last]
+    # Spearman 相關
+    ranks = df[feature_cols].rank()
+    corr = ranks.corr()
+    return corr
+
+# ========== 使用示例 ==========
+if __name__ == "__main__":
+    # 假設你已經有 prices DataFrame（面板），和可選的 funda DataFrame
+    # prices 需要欄位：date, ric, open, high, low, close, volume（可選 amount, free_float_shares）
+    prices = pd.DataFrame()  # TODO: 換成你的數據
+    funda = None             # TODO: 若有基本面就傳進來
+
+    horizons = [1, 5, 20]
+    feats_to_eval = [
+        "mom_1m","mom_3m","rev_5d","vol_20d","illiq_20d","turnover",
+        "earnings_yield","pb","roe","rel_tick_bp","low_price_flag"
+    ]
+
+    px = build_features_daily(prices, funda)
+    fwd = make_forward_returns(px, horizons)
+
+    # Universe（可切換）：例如過濾過低價/過高相對tick
+    uni = (px["price"] >= 3.0) & (px["rel_tick_bp"] <= 30)
+
+    # 1) IC 統計
+    ic_sum = cross_sectional_ic(px, fwd, feature_cols=[f for f in feats_to_eval if f in px.columns], horizons=horizons, universe_filter=uni)
+    print("IC summary:")
+    print(ic_sum.sort_values(["h","ic_mean"], ascending=[True, False]).head(20))
+
+    # 2) 分層多空（示範對 mom_3m 在 20d horizon）
+    if "mom_3m" in px.columns:
+        perf, summ = ls_portfolio_backtest(px, fwd, feature="mom_3m", horizon=20, q=10, neutralize_by="ln_mktcap" if "ln_mktcap" in px.columns else None, universe_mask=uni)
+        print("Long-Short performance summary:", summ)
+        # perf["cum"] 是累積曲線，可畫圖
+
+    # 3) 特徵間 Spearman 相關
+    feat_cols = [c for c in feats_to_eval if c in px.columns]
+    corr = features_correlation(px, feature_cols=feat_cols, on_last_date=True)
+    print("Feature correlation (Spearman, last date):")
+    print(corr.round(2))
+實務建議（與 Delta One/低價股兼容）
+
+評估指標對齊業務目標
+以橫截面 IC 與分層多空的年化 Sharpe、勝率作為篩選標準；低價股環境下，價量因子（動量、反轉、波動/流動性）通常比傳統估值（PE/PB）在短中期更直接。
+低價股專屬處理
+報告中同時給「全量」與「過濾（price≥3 或 rel_tick_bp≤30）」兩套統計；多半會看到過濾後的 IC/Sharpe 明顯提升。
+把 rel_tick_bp 不僅當過濾條件，也當解釋變數：檢查它與未來收益的關係，或用它對其他因子做分組（高 tick/低 tick 環境下因子有效性差異）。
+避免前視
+基本面用披露日對齊並至少滯後1個交易日；若你有精確公告時間戳與停牌資訊，滯後規則再嚴格一些。
+後續擴展
+若你要服務做市/對沖決策，可把勝率/Sharpe較好的特徵壓到「做市面板」中，轉成安全度/偏移/PI 建議（之前回覆提供了做市引擎原型）。
+亦可加「多因子合成分數」：當天對每檔做橫截面標準化後加權（IC加權或風險平價），再評估多空表現。
+如果你把一小段樣例數據（幾十個代碼×半年）貼過來，我可以幫你把：
+
+特徵清單精簡到在你池子裡真正有效的那幾個；
+設好 universe 過濾（低價/流動性）與中性化（市值/行業）；
+輸出一份乾淨的報表：每個特徵×各 horizon 的 IC、t 值、LS 年化 Sharpe、勝率，以及特徵間相關矩陣。
+2:05 AM
+if just lv1 tick, and trade info?
+lv1 tick are time, bid, ask, bid size, ask size and vol
+trade are time, px, vol --reasoning_effort medium
+
+2:18 AM
+
+GPT-5
+
+可以，只用 L1 報價（time、bid、ask、bid_size、ask_size）和逐筆成交（time、px、vol），就能做一套「tick-aware」的特徵生成、前瞻收益、相關、Sharpe 與勝率評估。下面給你
+
+低價股/做市友好的特徵清單（不依賴深度，不用基本面）
+整套可直接跑的 Python 代碼：從逐筆數據 → 1秒網格 → 特徵 → 前瞻收益 → 相關/Sharpe/勝率
+使用說明與實務建議
+你可直接把每檔股票的 quotes_df、trades_df 丟進去（欄位名見下），就可得到報表。
+
+一、只用 L1 能做的核心特徵（低價股友好）
+
+成本/刻度
+mid = (bid+ask)/2
+spread、rel_spread = spread/mid
+rel_tick = tick_size/mid（A股多為 tick=0.01）
+流動性/薄厚度
+queue imbalance QI = (bid_size - ask_size)/(bid_size + ask_size)
+microprice = (askbid_size + bidask_size)/(bid_size+ask_size)
+micro-premium = (microprice - mid)/mid（或用「檔」：/tick_size）
+ask_thin / bid_thin：size 相對自身分位數偏小
+訂單流向
+Lee–Ready 用 mid 給逐筆成交打標籤：buy/sell，得到每秒買量、賣量、淨成交不平衡 TI = (buy_vol - sell_vol)/(total_vol)
+交易強度：trades_per_s、vol_per_s（以及其滾動均值/標準化）
+動量/波動
+短期回報 r_w（mid 的 w 秒報酬）
+realized vol（1秒報酬的滾動標準差）
+z_slope（r_w 除以 w 窗的波動，近似 t-統計）
+平盤/噪音過濾
+flat_regime：realized_vol_bp < c × rel_spread_bp（例如 c=2），避免在點差級噪音下做方向判斷
+二、評估指標
+
+feature vs 未來收益的秩相關（Spearman，時間序列或跨標的）
+方向化勝率與 Sharpe
+以單一特徵的高/低分位（例如前30%、後30%）做 +1/−1 持倉，持有 h 秒
+返回：平均收益、Sharpe（按 h 秒持有折算到日頻）、勝率（收益>0 的比例）
+可選成本修正
+成本（bp）用當下 rel_spread_bp 粗估：一進一出 = 1×rel_spread_bp（或你自定）
+三、完整可跑的代碼
+依賴：pandas、numpy。資料格式：
+
+quotes_df：columns = ["time","bid","ask","bid_size","ask_size"]（time 可為 tz-aware/naive）
+trades_df：columns = ["time","px","vol"]
+python
+
+Run
+
+Copy
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Optional, Tuple
+
+TRADING_SECONDS_PER_DAY_CN = 4 * 60 * 60  # 9:30-11:30, 13:00-15:00 共 14400 秒
+
+# ---------- 時間/對齊 ----------
+def _to_dt(s):
+    s = pd.to_datetime(s)
+    try:
+        return s.tz_convert(None)
+    except Exception:
+        return s.tz_localize(None)
+
+def china_continuous_session_mask(index: pd.DatetimeIndex) -> pd.Series:
+    # 過濾 A 股連續競價時段
+    t = index.tz_localize(None)
+    hms = t.strftime("%H:%M:%S")
+    am = (hms >= "09:30:00") & (hms <= "11:30:00")
+    pm = (hms >= "13:00:00") & (hms <= "15:00:00")
+    return pd.Series(am | pm, index=index)
+
+# ---------- 逐筆成交打標籤（Lee-Ready 簡化版） ----------
+def classify_trade_sides(trades: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame:
+    """
+    trades: time, px, vol
+    quotes: time, mid
+    返回 trades 增加 side(+1/-1)、signed_vol
+    """
+    t = trades.copy()
+    q = quotes[["mid"]].copy()
+    t["time"] = _to_dt(t["time"])
+    q["time"] = _to_dt(q.index if q.index.name is not None else q["time"])
+    t = t.sort_values("time")
+    q = q.sort_values("time")
+    merged = pd.merge_asof(t, q.reset_index().rename(columns={"index":"time"}), on="time", direction="backward")
+    mid = merged["mid"].astype(float)
+    side = np.sign(merged["px"].astype(float) - mid)
+    # 平價用上一筆 side（或 0）
+    same = (side == 0)
+    side = side.replace(0, np.nan).fillna(method="ffill").fillna(0.0)
+    merged["side"] = side
+    merged["signed_vol"] = merged["vol"].astype(float) * merged["side"].astype(float)
+    return merged[["time","px","vol","side","signed_vol"]]
+
+# ---------- 1秒網格 ----------
+def make_1s_grid(quotes_df: pd.DataFrame,
+                 trades_df: pd.DataFrame,
+                 tick_size: float = 0.01) -> pd.DataFrame:
+    # 报价
+    q = quotes_df.copy()
+    q["time"] = _to_dt(q["time"])
+    q = q.sort_values("time").set_index("time")
+    q = q[["bid","ask","bid_size","ask_size"]].astype(float)
+    # 1s 重取樣（last），再向前填充
+    q1 = q.resample("1S").last().ffill()
+    q1 = q1[china_continuous_session_mask(q1.index)]
+    q1["mid"] = (q1["bid"] + q1["ask"]) / 2.0
+    q1["spread"] = (q1["ask"] - q1["bid"]).clip(lower=0)
+    q1["rel_spread"] = q1["spread"] / (q1["mid"] + 1e-12)
+    q1["tick_size"] = float(tick_size)
+    q1["rel_tick"] = q1["tick_size"] / (q1["mid"] + 1e-12)
+
+    # microprice 與 QI
+    denom = (q1["bid_size"] + q1["ask_size"]).replace(0, np.nan)
+    micro = (q1["ask"] * q1["bid_size"] + q1["bid"] * q1["ask_size"]) / denom
+    q1["microprice"] = micro.fillna(q1["mid"])
+    q1["qi"] = (q1["bid_size"] - q1["ask_size"]) / (q1["bid_size"] + q1["ask_size"] + 1e-12)
+    q1["micro_prem"] = (q1["microprice"] - q1["mid"]) / (q1["mid"] + 1e-12)  # 相對中位價
+    # 以「檔」為尺度（低價股友好）
+    q1["micro_prem_ticks"] = (q1["microprice"] - q1["mid"]) / (q1["tick_size"] + 1e-12)
+
+    # 逐筆成交聚合到 1s
+    if trades_df is not None and len(trades_df) > 0:
+        t = trades_df.copy()
+        t["time"] = _to_dt(t["time"])
+        t = t.sort_values("time")
+        # 打標籤
+        mid_series = q1[["mid"]].copy()
+        mid_series["time"] = mid_series.index
+        lab = classify_trade_sides(t, mid_series)
+        lab = lab.set_index("time")
+        agg = pd.DataFrame({
+            "vwap": (lab["px"] * lab["vol"]).resample("1S").sum() / (lab["vol"].resample("1S").sum() + 1e-12),
+            "trd_vol": lab["vol"].resample("1S").sum(),
+            "trd_cnt": lab["vol"].resample("1S").count(),
+            "buy_vol": lab.loc[lab["side"] > 0, "vol"].resample("1S").sum(),
+            "sell_vol": lab.loc[lab["side"] < 0, "vol"].resample("1S").sum(),
+            "signed_vol": lab["signed_vol"].resample("1S").sum(),
+        })
+        agg = agg.fillna(0.0)
+        agg = agg[china_continuous_session_mask(agg.index)]
+        df = q1.join(agg, how="left").fillna({"trd_vol":0.0,"trd_cnt":0.0,"buy_vol":0.0,"sell_vol":0.0,"signed_vol":0.0})
+    else:
+        df = q1.copy()
+        for c in ["vwap","trd_vol","trd_cnt","buy_vol","sell_vol","signed_vol"]:
+            df[c] = 0.0
+
+    # 成交不平衡與強度
+    df["ti"] = (df["buy_vol"] - df["sell_vol"]) / (df["trd_vol"] + 1e-12)
+    df["trades_per_s"] = df["trd_cnt"]
+    df["vol_per_s"] = df["trd_vol"]
+
+    return df
+
+# ---------- 特徵（以 1s 網格為基礎） ----------
+def add_features(df: pd.DataFrame, windows: List[int] = [30, 60, 120]) -> pd.DataFrame:
+    out = df.copy()
+    out["ret_1s"] = out["mid"].pct_change()
+
+    for w in windows:
+        # 價格動量（w秒）
+        out[f"ret_{w}s"] = out["mid"].pct_change(w)
+        # 波動（1秒報酬的滾動標準差）
+        out[f"rv_{w}s"] = out["ret_1s"].rolling(w).std().fillna(0.0)
+        # 標準化動量（近似 t-統計）
+        denom = (out[f"rv_{w}s"] * np.sqrt(max(w,1)) + 1e-12)
+        out[f"z_slope_{w}s"] = out[f"ret_{w}s"] / denom
+        # 成交/量強度（標準化）
+        out[f"lambda_{w}s"] = (out["trades_per_s"].rolling(w).mean() /
+                               (out["trades_per_s"].rolling(w).std() + 1e-12))
+        out[f"vint_{w}s"] = (out["vol_per_s"].rolling(w).mean() /
+                             (out["vol_per_s"].rolling(w).std() + 1e-12))
+        # 平盤/噪音 regime
+        out[f"flat_{w}s"] = ((out[f"rv_{w}s"] * 1e4) < (2.0 * out["rel_spread"] * 1e4)).astype(int)
+
+        # 平滑後的不平衡
+        out[f"qi_ma_{w}s"] = out["qi"].rolling(w).mean()
+        out[f"ti_ma_{w}s"] = out["ti"].rolling(w).mean()
+        out[f"micro_prem_ticks_ma_{w}s"] = out["micro_prem_ticks"].rolling(w).mean()
+
+        # 薄量旗標（相對自身歷史分位）
+        out[f"ask_thin_{w}s"] = (out["ask_size"] <= out["ask_size"].rolling(600).quantile(0.2)).astype(int)
+        out[f"bid_thin_{w}s"] = (out["bid_size"] <= out["bid_size"].rolling(600).quantile(0.2)).astype(int)
+
+    # 便於觀察的 bp 度量
+    out["rel_spread_bp"] = out["rel_spread"] * 1e4
+    out["rel_tick_bp"] = out["rel_tick"] * 1e4
+    return out
+
+# ---------- 前瞻收益（秒） ----------
+def make_forward_returns_seconds(df: pd.DataFrame, horizons: List[int]) -> pd.DataFrame:
+    out = df.copy()
+    for h in horizons:
+        out[f"fret_{h}s"] = out["mid"].pct_change(h).shift(-h)
+    return out
+
+# ---------- 相關/Sharpe/勝率 ----------
+def spearman_ts_corr(feature: pd.Series, target: pd.Series) -> float:
+    d = pd.concat([feature, target], axis=1).dropna()
+    if len(d) < 20:
+        return np.nan
+    return d.iloc[:,0].rank().corr(d.iloc[:,1].rank())
+
+def evaluate_feature_time_series(df: pd.DataFrame,
+                                 feature: str,
+                                 horizons: List[int],
+                                 q: float = 0.3,
+                                 cost_mode: str = "none"  # "none" 或 "spread"
+                                 ) -> pd.DataFrame:
+    """
+    單股票時間序列評估：
+    - 相關（Spearman）：feature vs fret_h
+    - 方向化策略：長 top q、短 bottom q，持有 h 秒
+    - Sharpe：按 h 秒持有折算到日頻；勝率：PnL>0 比例
+    - 成本：cost_mode="spread" 時，每筆扣 1×rel_spread（進出各半）
+    """
+    res = []
+    z = (df[feature] - df[feature].rolling(600).mean()) / (df[feature].rolling(600).std() + 1e-12)
+    lo = z.quantile(q)
+    hi = z.quantile(1 - q)
+    pos = pd.Series(0.0, index=df.index)
+    pos[z <= lo] = -1.0
+    pos[z >= hi] = +1.0
+
+    for h in horizons:
+        fret = df[f"fret_{h}s"]
+        # 相關
+        ic = spearman_ts_corr(df[feature], fret)
+
+        # 收益序列（重疊，近似）
+        pnl = pos * fret
+        if cost_mode == "spread":
+            # 進出合計 1×rel_spread，近似攤到當刻
+            pnl = pnl - (pos.abs() * df["rel_spread"]).fillna(0.0)
+
+        pnl = pnl.dropna()
+        if len(pnl) < 50:
+            res.append({"feature": feature, "h": h, "ic": ic, "n": len(pnl),
+                        "mean": np.nan, "std": np.nan, "ann_sharpe": np.nan, "winrate": np.nan})
+            continue
+
+        mean = pnl.mean()
+        std = pnl.std(ddof=0)
+        # 年化：每筆是 h 秒持有，日內約 TRADING_SECONDS_PER_DAY_CN/h 次非重疊機會
+        ann_sharpe = np.sqrt(252 * max(TRADING_SECONDS_PER_DAY_CN / max(h,1), 1)) * (mean / (std + 1e-12))
+        winrate = (pnl > 0).mean()
+
+        res.append({
+            "feature": feature, "h": h, "ic": ic, "n": int(len(pnl)),
+            "mean": float(mean), "std": float(std),
+            "ann_sharpe": float(ann_sharpe), "winrate": float(winrate)
+        })
+    return pd.DataFrame(res)
+
+# ---------- 一站式：從原始逐筆到評估 ----------
+def run_l1_pipeline(quotes_df: pd.DataFrame,
+                    trades_df: pd.DataFrame,
+                    tick_size: float = 0.01,
+                    feat_windows: List[int] = [30,60,120],
+                    horizons: List[int] = [10,30,60,180],
+                    cost_mode: str = "none") -> Tuple[pd.DataFrame, pd.DataFrame]:
+    grid = make_1s_grid(quotes_df, trades_df, tick_size=tick_size)
+    feats = add_features(grid, windows=feat_windows)
+    feats = make_forward_returns_seconds(feats, horizons=horizons)
+
+    # 選幾個常用單因子做評估（你可自行擴展）
+    feature_list = []
+    for w in feat_windows:
+        feature_list += [f"z_slope_{w}s", f"qi_ma_{w}s", f"ti_ma_{w}s", f"micro_prem_ticks_ma_{w}s"]
+
+    reports = []
+    for f in feature_list:
+        if f in feats.columns:
+            rep = evaluate_feature_time_series(feats, f, horizons=horizons, cost_mode=cost_mode)
+            reports.append(rep)
+    report = pd.concat(reports, ignore_index=True) if reports else pd.DataFrame()
+    return feats, report
+用法示例
+
+你針對單一股票，準備兩個 DataFrame：
+quotes_df: ["time","bid","ask","bid_size","ask_size"]
+trades_df: ["time","px","vol"]
+執行
+python
+
+Run
+
+Copy
+feats, report = run_l1_pipeline(quotes_df, trades_df,
+                                tick_size=0.01,
+                                feat_windows=[30,60,120],
+                                horizons=[10,30,60,180],
+                                cost_mode="spread")  # 或 "none"
+print(report.sort_values(["h","ann_sharpe"], ascending=[True, False]).head(20))
+輸出說明
+
+report 每行是「特徵 × 持有秒數」：
+ic：特徵與未來收益的 Spearman 秩相關（時間序列）
+mean/std：每步 PnL 的均值/標準差（默認用 mid 變動；若 cost_mode="spread" 則含成本）
+ann_sharpe：按持有 h 秒折算到日頻的近似年化 Sharpe
+winrate：方向正確的比例
+feats 裡包含所有 1秒級的特徵與前瞻收益欄位，你可以另作模型或做市面板
+實務建議（特別針對低價股與做市）
+
+一律「以檔為單位」觀察：關注 micro_prem_ticks、rel_tick_bp、rel_spread_bp，特徵與評估都對 tick 做刻度化
+使用 flat_regime 過濾：當 realized_vol 的 bp 小於 2×rel_spread_bp，多半是點差噪音，方向訊號不穩定
+在評估時報兩版
+cost_mode="none"：看純預測力
+cost_mode="spread"：看成本後是否仍有邊際
+若之後要服務做市報價
+將 z_slope、qi、ti、micro_prem_ticks 等轉成「安全度/偏移/PI」建議（我先前回覆提供了做市引擎原型）
+低價股務必對 PI/偏移做「半檔或一檔」量化
